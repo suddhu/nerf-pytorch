@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm, trange
+from torch.utils.tensorboard import SummaryWriter
 
 import matplotlib.pyplot as plt
 
@@ -18,11 +19,9 @@ from load_deepvoxels import load_dv_data
 from load_blender import load_blender_data
 from load_LINEMOD import load_LINEMOD_data
 
-
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 np.random.seed(0)
 DEBUG = False
-
 
 def batchify(fn, chunk):
     """Constructs a version of 'fn' that applies to smaller batches.
@@ -93,7 +92,7 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
       extras: dict with everything returned by render_rays().
     """
     if c2w is not None:
-        # special case to render full image
+        # special case to render full image (origin and direction of all rays)
         rays_o, rays_d = get_rays(H, W, K, c2w)
     else:
         # use provided ray batch
@@ -123,7 +122,7 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
         rays = torch.cat([rays, viewdirs], -1)
 
     # Render and reshape
-    all_ret = batchify_rays(rays, chunk, **kwargs)
+    all_ret = batchify_rays(rays, chunk, **kwargs) # minibatch rays and do vol. rendering
     for k in all_ret:
         k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
         all_ret[k] = torch.reshape(all_ret[k], k_sh)
@@ -151,6 +150,7 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
     for i, c2w in enumerate(tqdm(render_poses)):
         print(i, time.time() - t)
         t = time.time()
+        # vol. render along rays in minibatches, get (r, g, b), inv. depth, and acc. alpha
         rgb, disp, acc, _ = render(H, W, K, chunk=chunk, c2w=c2w[:3,:4], **render_kwargs)
         rgbs.append(rgb.cpu().numpy())
         disps.append(disp.cpu().numpy())
@@ -178,14 +178,18 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
 def create_nerf(args):
     """Instantiate NeRF's MLP model.
     """
+    # apply positional encoding function for (x, y, z): \gamma(\mathbf{x})
+    # args.multires: L = 10, args.multires_views: L = 4 (pg. 8), args.i_embed: 0
     embed_fn, input_ch = get_embedder(args.multires, args.i_embed)
 
     input_ch_views = 0
     embeddirs_fn = None
+    # positional encoding for direction \gamma(\mathbf{d})
     if args.use_viewdirs:
         embeddirs_fn, input_ch_views = get_embedder(args.multires_views, args.i_embed)
     output_ch = 5 if args.N_importance > 0 else 4
     skips = [4]
+    # MLP: default 8-depth, 256-width, 3 input channel, 5 output channel? 
     model = NeRF(D=args.netdepth, W=args.netwidth,
                  input_ch=input_ch, output_ch=output_ch, skips=skips,
                  input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
@@ -212,7 +216,7 @@ def create_nerf(args):
 
     ##########################
 
-    # Load checkpoints
+    # Load checkpoints: most recent tar file
     if args.ft_path is not None and args.ft_path!='None':
         ckpts = [args.ft_path]
     else:
@@ -236,14 +240,14 @@ def create_nerf(args):
 
     render_kwargs_train = {
         'network_query_fn' : network_query_fn,
-        'perturb' : args.perturb,
-        'N_importance' : args.N_importance,
-        'network_fine' : model_fine,
-        'N_samples' : args.N_samples,
-        'network_fn' : model,
+        'perturb' : args.perturb, # jitter
+        'N_importance' : args.N_importance, # N_f
+        'network_fine' : model_fine, # \hat{C}_f(r) model
+        'N_samples' : args.N_samples, # N_c
+        'network_fn' : model, # \hat{C}_c(r) model
         'use_viewdirs' : args.use_viewdirs,
         'white_bkgd' : args.white_bkgd,
-        'raw_noise_std' : args.raw_noise_std,
+        'raw_noise_std' : args.raw_noise_std, # reg. noise 
     }
 
     # NDC only good for LLFF-style forward facing data
@@ -252,6 +256,7 @@ def create_nerf(args):
         render_kwargs_train['ndc'] = False
         render_kwargs_train['lindisp'] = args.lindisp
 
+    # copy and modify for test arguments 
     render_kwargs_test = {k : render_kwargs_train[k] for k in render_kwargs_train}
     render_kwargs_test['perturb'] = False
     render_kwargs_test['raw_noise_std'] = 0.
@@ -517,22 +522,23 @@ def config_parser():
                         help='will take every 1/N images as LLFF test set, paper uses 8')
 
     # logging/saving options
-    parser.add_argument("--i_print",   type=int, default=100, 
+    parser.add_argument("--i_print",   type=int, default=50, 
                         help='frequency of console printout and metric loggin')
     parser.add_argument("--i_img",     type=int, default=500, 
                         help='frequency of tensorboard image logging')
     parser.add_argument("--i_weights", type=int, default=10000, 
                         help='frequency of weight ckpt saving')
-    parser.add_argument("--i_testset", type=int, default=50000, 
+    parser.add_argument("--i_testset", type=int, default=20000, 
                         help='frequency of testset saving')
-    parser.add_argument("--i_video",   type=int, default=50000, 
+    parser.add_argument("--i_video",   type=int, default=20000, 
                         help='frequency of render_poses video saving')
-
+    parser.add_argument("--niters",   type=int, default=100000, 
+                        help='Total number of iterations')
     return parser
 
 
 def train():
-
+    # parse arguments 
     parser = config_parser()
     args = parser.parse_args()
 
@@ -568,14 +574,15 @@ def train():
 
     elif args.dataset_type == 'blender':
         images, poses, render_poses, hwf, i_split = load_blender_data(args.datadir, args.half_res, args.testskip)
-        print('Loaded blender', images.shape, render_poses.shape, hwf, args.datadir)
+        print('Loaded blender', images.shape, render_poses.shape, hwf, args.datadir) 
+        # images.shape: N x H x W x ch, render_poses.shape: M x 4 x 4, hwf: [H, W, foc]
         i_train, i_val, i_test = i_split
 
         near = 2.
         far = 6.
 
         if args.white_bkgd:
-            images = images[...,:3]*images[...,-1:] + (1.-images[...,-1:])
+            images = images[...,:3]*images[...,-1:] + (1.-images[...,-1:]) # multiply by alpha channel
         else:
             images = images[...,:3]
 
@@ -602,7 +609,7 @@ def train():
         hemi_R = np.mean(np.linalg.norm(poses[:,:3,-1], axis=-1))
         near = hemi_R-1.
         far = hemi_R+1.
-
+    # TODO: add conditional section for tactile data
     else:
         print('Unknown dataset type', args.dataset_type, 'exiting')
         return
@@ -612,6 +619,7 @@ def train():
     H, W = int(H), int(W)
     hwf = [H, W, focal]
 
+    # construct intrisic matrix
     if K is None:
         K = np.array([
             [focal, 0, 0.5*W],
@@ -619,6 +627,7 @@ def train():
             [0, 0, 1]
         ])
 
+    # default: false
     if args.render_test:
         render_poses = np.array(poses[i_test])
 
@@ -640,6 +649,7 @@ def train():
     render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(args)
     global_step = start
 
+    # near and far bounds TODO: change for tactile data. 
     bds_dict = {
         'near' : near,
         'far' : far,
@@ -650,7 +660,7 @@ def train():
     # Move testing data to GPU
     render_poses = torch.Tensor(render_poses).to(device)
 
-    # Short circuit if only rendering out from trained model
+    # Short circuit if only rendering out from trained model, no optimizing weights
     if args.render_only:
         print('RENDER ONLY')
         with torch.no_grad():
@@ -672,7 +682,7 @@ def train():
             return
 
     # Prepare raybatch tensor if batching random rays
-    N_rand = args.N_rand
+    N_rand = args.N_rand # batch sz per gradient step
     use_batching = not args.no_batching
     if use_batching:
         # For random ray batching
@@ -698,19 +708,19 @@ def train():
         rays_rgb = torch.Tensor(rays_rgb).to(device)
 
 
-    N_iters = 200000 + 1
+    N_iters = args.niters + 1
     print('Begin')
     print('TRAIN views are', i_train)
     print('TEST views are', i_test)
     print('VAL views are', i_val)
 
     # Summary writers
-    # writer = SummaryWriter(os.path.join(basedir, 'summaries', expname))
-    
+    writer = SummaryWriter(os.path.join(basedir, expname, 'summaries'))
     start = start + 1
+
+    # training outer-loop
     for i in trange(start, N_iters):
         time0 = time.time()
-
         # Sample random ray batch
         if use_batching:
             # Random over all images
@@ -762,11 +772,12 @@ def train():
                                                 **render_kwargs_train)
 
         optimizer.zero_grad()
-        img_loss = img2mse(rgb, target_s)
+        img_loss = img2mse(rgb, target_s) # pixel-wise mse
         trans = extras['raw'][...,-1]
         loss = img_loss
         psnr = mse2psnr(img_loss)
 
+        # output from coarse model
         if 'rgb0' in extras:
             img_loss0 = img2mse(extras['rgb0'], target_s)
             loss = loss + img_loss0
@@ -776,7 +787,7 @@ def train():
         optimizer.step()
 
         # NOTE: IMPORTANT!
-        ###   update learning rate   ###
+        ###   update learning rate: exponential decay from 5e-4 to 5e-5   ###
         decay_rate = 0.1
         decay_steps = args.lrate_decay * 1000
         new_lrate = args.lrate * (decay_rate ** (global_step / decay_steps))
@@ -788,7 +799,11 @@ def train():
         # print(f"Step: {global_step}, Loss: {loss}, Time: {dt}")
         #####           end            #####
 
-        # Rest is logging
+        ################################# NOTE: LOGGING scripts ################################
+        # For tensorboard
+        writer.add_scalar("loss", loss, i)
+        writer.add_scalar("psnr", psnr, i)
+        # Save model checkpoint every *i_weights* timesteps
         if i%args.i_weights==0:
             path = os.path.join(basedir, expname, '{:06d}.tar'.format(i))
             torch.save({
@@ -799,6 +814,7 @@ def train():
             }, path)
             print('Saved checkpoints at', path)
 
+        # Render test image video every *i_video* timesteps
         if i%args.i_video==0 and i > 0:
             # Turn on testing mode
             with torch.no_grad():
@@ -815,6 +831,7 @@ def train():
             #     render_kwargs_test['c2w_staticcam'] = None
             #     imageio.mimwrite(moviebase + 'rgb_still.mp4', to8b(rgbs_still), fps=30, quality=8)
 
+        # Render test images every *i_testset* timesteps
         if i%args.i_testset==0 and i > 0:
             testsavedir = os.path.join(basedir, expname, 'testset_{:06d}'.format(i))
             os.makedirs(testsavedir, exist_ok=True)
@@ -823,22 +840,9 @@ def train():
                 render_path(torch.Tensor(poses[i_test]).to(device), hwf, K, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
             print('Saved test set')
 
-
-    
         if i%args.i_print==0:
             tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
-        """
-            print(expname, i, psnr.numpy(), loss.numpy(), global_step.numpy())
-            print('iter time {:.05f}'.format(dt))
-
-            with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_print):
-                tf.contrib.summary.scalar('loss', loss)
-                tf.contrib.summary.scalar('psnr', psnr)
-                tf.contrib.summary.histogram('tran', trans)
-                if args.N_importance > 0:
-                    tf.contrib.summary.scalar('psnr0', psnr0)
-
-
+            '''
             if i%args.i_img==0:
 
                 # Log a rendered validation view to Tensorboard
@@ -867,12 +871,13 @@ def train():
                         tf.contrib.summary.image('rgb0', to8b(extras['rgb0'])[tf.newaxis])
                         tf.contrib.summary.image('disp0', extras['disp0'][tf.newaxis,...,tf.newaxis])
                         tf.contrib.summary.image('z_std', extras['z_std'][tf.newaxis,...,tf.newaxis])
-        """
-
+            '''
         global_step += 1
+    writer.flush()
+    writer.close()
+    return 0
 
 
 if __name__=='__main__':
     torch.set_default_tensor_type('torch.cuda.FloatTensor')
-
     train()

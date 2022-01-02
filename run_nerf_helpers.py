@@ -10,7 +10,6 @@ img2mse = lambda x, y : torch.mean((x - y) ** 2)
 mse2psnr = lambda x : -10. * torch.log(x) / torch.log(torch.Tensor([10.]))
 to8b = lambda x : (255*np.clip(x,0,1)).astype(np.uint8)
 
-
 # Positional encoding (section 5.1)
 class Embedder:
     def __init__(self, **kwargs):
@@ -44,7 +43,6 @@ class Embedder:
     def embed(self, inputs):
         return torch.cat([fn(inputs) for fn in self.embed_fns], -1)
 
-
 def get_embedder(multires, i=0):
     if i == -1:
         return nn.Identity(), 3
@@ -63,7 +61,7 @@ def get_embedder(multires, i=0):
     return embed, embedder_obj.out_dim
 
 
-# Model
+# NeRF Model
 class NeRF(nn.Module):
     def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips=[4], use_viewdirs=False):
         """ 
@@ -76,6 +74,7 @@ class NeRF(nn.Module):
         self.skips = skips
         self.use_viewdirs = use_viewdirs
         
+        # with skip connection to the 5th layer (pg. 18 Fig. 7)
         self.pts_linears = nn.ModuleList(
             [nn.Linear(input_ch, W)] + [nn.Linear(W, W) if i not in self.skips else nn.Linear(W + input_ch, W) for i in range(D-1)])
         
@@ -100,8 +99,9 @@ class NeRF(nn.Module):
             h = self.pts_linears[i](h)
             h = F.relu(h)
             if i in self.skips:
-                h = torch.cat([input_pts, h], -1)
+                h = torch.cat([input_pts, h], -1) # 5th layer
 
+        # orange arrow layer
         if self.use_viewdirs:
             alpha = self.alpha_linear(h)
             feature = self.feature_linear(h)
@@ -112,7 +112,7 @@ class NeRF(nn.Module):
                 h = F.relu(h)
 
             rgb = self.rgb_linear(h)
-            outputs = torch.cat([rgb, alpha], -1)
+            outputs = torch.cat([rgb, alpha], -1) # final vector
         else:
             outputs = self.output_linear(h)
 
