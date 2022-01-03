@@ -1,26 +1,35 @@
 import os, sys
+from os import environ, path as osp
 import numpy as np
 import imageio
 import json
 import random
 import time
 import torch
+torch.cuda.empty_cache()
+import gc
+gc.collect()
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm, trange
 from torch.utils.tensorboard import SummaryWriter
+import GPUtil
 
 import matplotlib.pyplot as plt
-
 from run_nerf_helpers import *
 
 from load_llff import load_llff_data
 from load_deepvoxels import load_dv_data
 from load_blender import load_blender_data
 from load_LINEMOD import load_LINEMOD_data
+from load_nerf import load_nerf_data
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-np.random.seed(0)
+GPUtil.showUtilization()
+deviceID = GPUtil.getFirstAvailable(order = 'first', maxLoad=0.5, maxMemory=0.5, attempts=1, interval=900, verbose=False)
+print('device best: ', deviceID)
+device = torch.device('cuda:' + str(deviceID[0]) if torch.cuda.is_available() else 'cpu')
+print('Using device:', device)
+# np.random.seed(0)
 DEBUG = False
 
 def batchify(fn, chunk):
@@ -147,7 +156,7 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
     disps = []
 
     t = time.time()
-    for i, c2w in enumerate(tqdm(render_poses)):
+    for i, c2w in enumerate(render_poses):
         print(i, time.time() - t)
         t = time.time()
         # vol. render along rays in minibatches, get (r, g, b), inv. depth, and acc. alpha
@@ -359,6 +368,8 @@ def render_rays(ray_batch,
     bounds = torch.reshape(ray_batch[...,6:8], [-1,1,2])
     near, far = bounds[...,0], bounds[...,1] # [-1,1]
 
+    # print("near: {n}, far: {f}".format(n = near, f = far)) # 0, 1?
+
     t_vals = torch.linspace(0., 1., steps=N_samples)
     if not lindisp:
         z_vals = near * (1.-t_vals) + far * (t_vals)
@@ -451,9 +462,9 @@ def config_parser():
                         help='learning rate')
     parser.add_argument("--lrate_decay", type=int, default=250, 
                         help='exponential learning rate decay (in 1000 steps)')
-    parser.add_argument("--chunk", type=int, default=1024*32, 
+    parser.add_argument("--chunk", type=int, default=1024*16, 
                         help='number of rays processed in parallel, decrease if running out of memory')
-    parser.add_argument("--netchunk", type=int, default=1024*64, 
+    parser.add_argument("--netchunk", type=int, default=1024*32, 
                         help='number of pts sent through network in parallel, decrease if running out of memory')
     parser.add_argument("--no_batching", action='store_true', 
                         help='only take random rays from 1 image at a time')
@@ -610,6 +621,25 @@ def train():
         near = hemi_R-1.
         far = hemi_R+1.
     # TODO: add conditional section for tactile data
+    elif args.dataset_type == 'nerf':
+        images, masks, poses, render_poses, hwf, i_split = load_nerf_data(args.datadir, args.half_res, args.testskip)
+        print('Loaded nerf images', images.shape, masks.shape, render_poses.shape, hwf, args.datadir) 
+        # images.shape: N x H x W x ch, render_poses.shape: M x 4 x 4, hwf: [H, W, foc]
+        # images.shape: (826, 200, 200, 3), masks.shape: (826, 400, 400, 3), render_poses.shape: (826, 4, 4)
+        i_train, i_val, i_test = i_split
+        near = 0.
+        far = 0.06
+        # import pdb; pdb.set_trace()
+        if args.white_bkgd:
+            images = images*masks[...,np.newaxis] + (1.-masks[...,np.newaxis]) # multiply by alpha channel
+        
+        for i, image in enumerate(images[i_test]):
+            rgb8 = to8b(image)
+            filename = os.path.join(args.datadir, "temp", '{:03d}.png'.format(i))
+            imageio.imwrite(filename, rgb8)
+
+        # import pdb; pdb.set_trace()
+
     else:
         print('Unknown dataset type', args.dataset_type, 'exiting')
         return
@@ -719,7 +749,7 @@ def train():
     start = start + 1
 
     # training outer-loop
-    for i in trange(start, N_iters):
+    for i in range(start, N_iters):
         time0 = time.time()
         # Sample random ray batch
         if use_batching:
@@ -841,7 +871,7 @@ def train():
             print('Saved test set')
 
         if i%args.i_print==0:
-            tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
+            print(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
             '''
             if i%args.i_img==0:
 
@@ -879,5 +909,20 @@ def train():
 
 
 if __name__=='__main__':
+    abspath = osp.abspath(__file__)
+    dname = osp.dirname(abspath)
+    os.chdir(dname)
+    # print(torch.cuda.memory_summary(device=None, abbreviated=False))
+
+    # print('Num. GPUs:', torch.cuda.device_count())
+    # devices = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
+    # print('[%s]' % ', '.join(map(str, devices)))
+
+    # setting device on GPU if available, else CPU
+
+    # for i in range(torch.cuda.device_count()):
+    #     #Additional Info when using cuda
+    #     print(torch.cuda.memory_stats(i))
+
     torch.set_default_tensor_type('torch.cuda.FloatTensor')
     train()
